@@ -1,0 +1,62 @@
+SELECT * FROM `bq-cryptoshredding.covids.covid19_open_data` LIMIT 20
+
+# Create the keys data, use the partition function to create only one key for rows sharing the same wikidata_id
+create table bq-cryptoshredding.covids.wikidata_keys_temp (wikidata_id string,keyset bytes,rn int64) as select A.* from(select wikidata_id,KEYS.NEW_KEYSET('AEAD_AES_GCM_256') as keyset,ROW_NUMBER() OVER (PARTITION BY wikidata_id) as rn from bq-cryptoshredding.covids.covid19_open_data) A where A.rn=1;
+
+# Create a new table to drop the rownumber column
+create table bq-cryptoshredding.covids.wikidata_keys as select wikidata_id, keyset from bq-cryptoshredding.covids.wikidata_keys_temp;
+
+select count (*) from `bq-cryptoshredding.covids.wikidata_keys`;
+
+# create a new table to store the encrypted data, here we will keep the wikidata_id and the encrypted country name
+create table `bq-cryptoshredding.covids.open_data_encrypted` (wikidata_id string,country_name bytes) as select wikidata_id,AEAD.ENCRYPT((select keyset from `bq-cryptoshredding.covids.wikidata_keys` where `bq-cryptoshredding.covids.covid19_open_data`.wikidata_id=`bq-cryptoshredding.covids.wikidata_keys`.wikidata_id),country_name,`bq-cryptoshredding.covids.covid19_open_data`.wikidata_id) from `bq-cryptoshredding.covids.covid19_open_data`; 
+
+# Validate the country name was encrypted 
+select * from `bq-cryptoshredding.covids.open_data_encrypted` limit 20;
+
+# Validate decrypting of data
+select wikidata_id, AEAD.DECRYPT_STRING((select keyset from `bq-cryptoshredding.covids.wikidata_keys` where `bq-cryptoshredding.covids.open_data_encrypted`.wikidata_id=`bq-cryptoshredding.covids.wikidata_keys`.wikidata_id),country_name,`bq-cryptoshredding.covids.open_data_encrypted`.wikidata_id) from `bq-cryptoshredding.covids.open_data_encrypted` limit 20;
+
+# Create a new table in BigQuery with the keys in string format not bytes. The reason for doing this is that BigTable stores the data in the form of a struct of key value pairs where the values are usually string. The problem is that AEAD decrypt function expects the keys as bytes, using a string value would make the fuction unable to recognise the keys and fail to decrypt the data
+create table `bq-cryptoshredding.covids.wikidata_keys_string` (wikidata_id string,keyset string) as select wikidata_id,to_hex(keyset) from `bq-cryptoshredding.covids.wikidata_keys`;
+
+# Store keys as strings in GCS (gcloud) 
+# bq extract covids.wikidata_keys_string gs://bktble/keys_str_hex.csv
+# gsutil cp gs://bktble/keys_str_hex.csv ./keys_str_hex.csv
+# vi keys_str_hex.csv, (remove wikidata_id)
+
+# Create BigTable instance (gcloud)
+# gcloud bigtable instances create covid-ins --display-name=covid --cluster-config=id=covid-cls,zone=us-central1-b
+
+# Import Keys to BigTable
+# cbt -project bq-cryptoshredding -instance covid-ins createtable keys families="key_data"
+# cbt -project bq-cryptoshredding -instance covid-ins import keys keys_str_hex.csv column-family=key_data
+
+# Make BigTable key table available to BigQuery
+# vi td.json
+# bq mk --external_table_definition=td.json covids.btkeys
+
+
+# Remember to convert the keys back to bytes before passing to the AEAD decrypt function
+select data.wikidata_id AS ID, SAFE.AEAD.DECRYPT_STRING(from_hex(cast(mapping.key_data.column[OFFSET(0)].cell[OFFSET(0)].value as string)), data.country_name, wikidata_id) AS payload from `bq-cryptoshredding.covids.open_data_encrypted` data JOIN `bq-cryptoshredding.covids.btkeys` mapping ON SAFE_CONVERT_BYTES_TO_STRING(mapping.rowkey) = data.wikidata_id LIMIT 20;
+
+# bq mk --location=us viewds (gCloud)
+# bq mk --location=us datads
+
+# Copy the data and key tables to the datads dataset
+create table `bq-cryptoshredding.datads.open_data_encrypted` (wikidata_id string,country_name bytes) as select * from `bq-cryptoshredding.covids.open_data_encrypted`;
+
+create table `bq-cryptoshredding.datads.wikidata_keys` as select * from `bq-cryptoshredding.covids.wikidata_keys`;
+
+# Create a view in the viewds dataset that joins the data and keys table to apply the decryption function
+create or replace view `bq-cryptoshredding.viewds.decrypted_view` (wikidata_id , country_name) as select wikidata_id, AEAD.DECRYPT_STRING((select keyset from `bq-cryptoshredding.datads.wikidata_keys` where `bq-cryptoshredding.datads.open_data_encrypted`.wikidata_id=`bq-cryptoshredding.datads.wikidata_keys`.wikidata_id),country_name, `bq-cryptoshredding.datads.open_data_encrypted`.wikidata_id) from `bq-cryptoshredding.datads.open_data_encrypted`;
+
+# Validate that the view returns decrypted data
+select * from `bq-cryptoshredding.viewds.decrypted_view` LIMIT 20;
+
+# (Console)
+# add user to bigquery user role in IAM 
+# create auth view on viewds decrypted on tables
+
+
+
